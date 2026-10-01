@@ -9,6 +9,7 @@ import json
 import time
 import subprocess
 import tempfile
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime
 
@@ -70,9 +71,17 @@ with st.sidebar:
     )
     llm_model = st.selectbox(
         "Gemini model",
-        ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"],
+        [
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.5-flash",
+            "gemini-3.1-flash-lite",
+        ],
         index=0,
-        help="Gemini 3.8 Flash is the latest Flash model (GA).",
+        help=(
+            "If 3.8 Flash returns 503, try 3.1 Flash-Lite — it's often "
+            "more reliable during peak demand."
+        ),
     )
 
     st.divider()
@@ -197,7 +206,7 @@ def transcribe(audio_path: Path, model_size: str) -> dict:
 
 
 # ------------------------------------------------------------------
-# GEMINI: STRUCTURE TRANSCRIPT INTO A DOCUMENT (with retry)
+# GEMINI: STRUCTURE TRANSCRIPT (with timeout + retry)
 # ------------------------------------------------------------------
 STRUCTURE_PROMPT = """You are an expert technical writer. You will receive a raw transcript of a training/knowledge-transfer video.
 
@@ -234,7 +243,10 @@ Do not include markdown, code fences, or any text outside the JSON.
 def structure_with_llm(
     transcript: dict, api_key: str, model: str, max_retries: int = 3
 ) -> dict:
-    """Call Gemini (via OpenAI-compatible endpoint) with retry on 503/429."""
+    """
+    Call Gemini (via OpenAI-compatible endpoint).
+    Uses a hard timeout so hung requests trigger retry instead of blocking.
+    """
     from openai import OpenAI
 
     # Build timestamped transcript
@@ -250,24 +262,36 @@ def structure_with_llm(
     client = OpenAI(
         api_key=api_key,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        timeout=60.0,
     )
+
+    def _make_call():
+        return client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": STRUCTURE_PROMPT},
+                {"role": "user", "content": transcript_with_ts},
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
 
     last_error = None
     for attempt in range(max_retries):
         try:
             with st.spinner(
-                f"Structuring document with {model}... "
+                f"Structuring with {model}... "
                 f"(attempt {attempt + 1}/{max_retries})"
             ):
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": STRUCTURE_PROMPT},
-                        {"role": "user", "content": transcript_with_ts},
-                    ],
-                    temperature=0.3,
-                    response_format={"type": "json_object"},
-                )
+                # Run in a thread with a hard 90s timeout so hangs fail fast
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    future = ex.submit(_make_call)
+                    try:
+                        resp = future.result(timeout=90)
+                    except concurrent.futures.TimeoutError:
+                        raise TimeoutError(
+                            "Gemini API timed out after 90s (server hang)"
+                        )
 
             raw = resp.choices[0].message.content
             try:
@@ -284,20 +308,18 @@ def structure_with_llm(
         except Exception as e:
             last_error = e
             error_str = str(e)
-            if (
-                "503" in error_str
-                or "429" in error_str
-                or "UNAVAILABLE" in error_str
-                or "high demand" in error_str
-            ):
-                if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) * 5  # 5s, 10s, 20s
-                    st.warning(
-                        f"Gemini is busy (503). Waiting {wait_time}s "
-                        f"before retry {attempt + 2}/{max_retries}..."
-                    )
-                    time.sleep(wait_time)
-                    continue
+            retryable = any(x in error_str for x in [
+                "503", "429", "UNAVAILABLE", "high demand",
+                "timed out", "Timeout", "overloaded",
+            ])
+            if retryable and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 5  # 5s, 10s, 20s
+                st.warning(
+                    f"Gemini is busy or hanging. Waiting {wait_time}s "
+                    f"before retry {attempt + 2}/{max_retries}..."
+                )
+                time.sleep(wait_time)
+                continue
             raise
 
     raise last_error
@@ -625,7 +647,7 @@ if generate and uploaded_file:
             f"✅ Transcribed {len(transcript.get('segments', []))} segments"
         )
 
-        # 4. LLM structuring (with retry on 503)
+        # 4. LLM structuring (with timeout + retry)
         status.write(f"🤖 Structuring document with {llm_model}...")
         doc = structure_with_llm(
             transcript, gemini_api_key, llm_model, max_retries=3
