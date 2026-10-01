@@ -1,20 +1,20 @@
 """
-KT Recording → PDF Generator (with AI-driven screenshot selection)
-Upload a video, transcribe it, pick relevant frames via CLIP,
-and generate a PDF with text + visuals.
+KT Recording → Structured Document PDF
+Upload a video → transcript → LLM structures it into headings/paragraphs
+→ CLIP picks relevant screenshots → PDF with optional transcript appendix.
 """
 
 import os
+import json
 import subprocess
 import tempfile
 from pathlib import Path
 from datetime import datetime
 
 # ------------------------------------------------------------------
-# CRITICAL FIX: Clear executable stack flag from ctranslate2 library
+# execstack fix for ctranslate2
 # ------------------------------------------------------------------
 def _fix_execstack_for(package_name: str):
-    """Clear execstack flag on .so files inside <package>.libs."""
     try:
         import site
         site_packages = Path(site.getsitepackages()[0])
@@ -37,21 +37,22 @@ _fix_execstack_for("ctranslate2")
 import base64
 import streamlit as st
 from fpdf import FPDF
-from PIL import Image
+from PIL import Image, ImageFilter
+import numpy as np
 
 # ------------------------------------------------------------------
 # PAGE CONFIG
 # ------------------------------------------------------------------
 st.set_page_config(
-    page_title="KT Recording → PDF",
+    page_title="KT Recording → Document",
     page_icon="📄",
     layout="wide",
 )
 
-st.title("📄 KT Recording → PDF Generator")
+st.title("📄 KT Recording → Structured Document")
 st.caption(
-    "Upload a recording. The app transcribes it, uses CLIP to pick "
-    "the most relevant frames, and generates a PDF with text + visuals."
+    "Upload a recording. The app transcribes it, uses AI to structure it "
+    "into headings and paragraphs, adds relevant screenshots, and generates a PDF."
 )
 
 # ------------------------------------------------------------------
@@ -60,30 +61,47 @@ st.caption(
 with st.sidebar:
     st.header("⚙️ Configuration")
 
+    st.subheader("LLM")
+    openai_api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        help="Used to structure the transcript into a document. Get one at platform.openai.com",
+    )
+    llm_model = st.selectbox(
+        "LLM model",
+        ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"],
+        index=0,
+        help="gpt-4o-mini is fast and cheap (~$0.02 per document).",
+    )
+
+    st.divider()
+    st.subheader("Transcription")
     whisper_model = st.selectbox(
         "Whisper model",
         ["tiny", "base", "small", "medium"],
         index=1,
     )
 
-    include_summary = st.checkbox("Include summary page", value=True)
+    st.divider()
+    st.subheader("Screenshots")
     include_screenshots = st.checkbox(
         "Add AI-selected screenshots", value=True,
-        help="Uses CLIP to score frames against transcript context.",
     )
-
     if include_screenshots:
-        num_screenshots = st.slider(
-            "Max screenshots", 1, 10, 5,
-            help="Upper limit on how many frames to embed.",
-        )
+        num_screenshots = st.slider("Max screenshots", 1, 10, 4)
         scene_threshold = st.slider(
             "Scene-change sensitivity", 0.10, 0.60, 0.30,
-            help="Lower = more frames considered. Higher = only big changes.",
         )
     else:
         num_screenshots = 0
         scene_threshold = 0.30
+
+    st.divider()
+    st.subheader("Output")
+    include_transcript = st.checkbox(
+        "Include full transcript appendix", value=False,
+        help="Adds the raw timestamped transcript at the end of the PDF.",
+    )
 
 # ------------------------------------------------------------------
 # UPLOAD
@@ -100,7 +118,7 @@ if uploaded_file:
         f"({uploaded_file.size / 1e6:.1f} MB)"
     )
 
-generate = st.button("🚀 Generate PDF", use_container_width=True, type="primary")
+generate = st.button("🚀 Generate Document", use_container_width=True, type="primary")
 
 # ------------------------------------------------------------------
 # WORKDIR
@@ -111,7 +129,7 @@ FRAMES_DIR = WORKDIR / "frames"
 
 
 # ------------------------------------------------------------------
-# STEP 1 — SAVE UPLOAD
+# HELPERS
 # ------------------------------------------------------------------
 def save_upload(uploaded_file) -> Path:
     suffix = Path(uploaded_file.name).suffix or ".mp4"
@@ -123,9 +141,6 @@ def save_upload(uploaded_file) -> Path:
     return out_path
 
 
-# ------------------------------------------------------------------
-# STEP 2 — EXTRACT AUDIO
-# ------------------------------------------------------------------
 def extract_audio(media_path: Path) -> Path:
     audio_path = WORKDIR / "audio.wav"
     if audio_path.exists():
@@ -144,8 +159,15 @@ def extract_audio(media_path: Path) -> Path:
     return audio_path
 
 
+def format_timestamp(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 # ------------------------------------------------------------------
-# STEP 3 — TRANSCRIBE
+# TRANSCRIBE
 # ------------------------------------------------------------------
 def transcribe(audio_path: Path, model_size: str) -> dict:
     from faster_whisper import WhisperModel
@@ -173,21 +195,85 @@ def transcribe(audio_path: Path, model_size: str) -> dict:
     }
 
 
-def format_timestamp(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+# ------------------------------------------------------------------
+# LLM: STRUCTURE TRANSCRIPT INTO A DOCUMENT
+# ------------------------------------------------------------------
+STRUCTURE_PROMPT = """You are an expert technical writer. You will receive a raw transcript of a training/knowledge-transfer video.
+
+Your job: convert it into a well-structured document that a reader can skim and understand.
+
+RULES:
+1. Identify 3–7 main topics covered in the transcript. These become SECTION HEADINGS.
+2. For each section, write a clear 2–4 sentence paragraph in your own words summarizing what was said. Do NOT copy-paste; synthesize.
+3. Under each section, add 2–4 bullet points of key facts, definitions, or examples mentioned.
+4. Add a short Executive Summary (3–5 sentences) at the top.
+5. Add a "Key Takeaways" section at the end (3–5 bullets).
+6. Include a "timestamp" field for each section — the start time (in seconds) where that topic begins in the video. This is used to attach screenshots.
+
+Return ONLY valid JSON, matching this schema exactly:
+
+{
+  "title": "string — concise title for the document",
+  "executive_summary": "string — 3–5 sentences",
+  "sections": [
+    {
+      "heading": "string",
+      "timestamp": number,
+      "paragraph": "string — 2–4 sentences",
+      "bullets": ["string", "string", ...]
+    }
+  ],
+  "key_takeaways": ["string", ...]
+}
+
+Do not include markdown, code fences, or any text outside the JSON.
+"""
+
+
+def structure_with_llm(transcript: dict, api_key: str, model: str) -> dict:
+    """Call LLM to convert raw transcript into structured JSON."""
+    from openai import OpenAI
+
+    # Build timestamped transcript text (with times so LLM can pick section starts)
+    lines = []
+    for seg in transcript.get("segments", []):
+        ts = format_timestamp(seg.get("start", 0))
+        lines.append(f"[{ts}] {seg['text'].strip()}")
+    transcript_with_ts = "\n".join(lines)
+
+    # Cap input size to avoid token limits (~15k chars ≈ 4k tokens)
+    if len(transcript_with_ts) > 60_000:
+        transcript_with_ts = transcript_with_ts[:60_000] + "\n[...truncated...]"
+
+    client = OpenAI(api_key=api_key)
+
+    with st.spinner(f"Structuring document with {model}..."):
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": STRUCTURE_PROMPT},
+                {"role": "user", "content": transcript_with_ts},
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+
+    raw = resp.choices[0].message.content
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"LLM returned invalid JSON: {e}\n\nRaw: {raw[:500]}")
+
+    # Basic schema validation
+    if "sections" not in doc or not isinstance(doc["sections"], list):
+        raise RuntimeError("LLM response missing 'sections' array.")
+    return doc
 
 
 # ------------------------------------------------------------------
-# STEP 4 — EXTRACT CANDIDATE FRAMES (scene detection)
+# FRAME EXTRACTION + CLIP SCORING
 # ------------------------------------------------------------------
 def extract_candidate_frames(video_path: Path, threshold: float) -> list:
-    """
-    Use ffmpeg scene-change filter to get candidate frames.
-    Returns list of {timestamp, path}.
-    """
     if FRAMES_DIR.exists():
         for f in FRAMES_DIR.glob("*.jpg"):
             f.unlink()
@@ -222,12 +308,8 @@ def extract_candidate_frames(video_path: Path, threshold: float) -> list:
     return candidates
 
 
-# ------------------------------------------------------------------
-# STEP 5 — AI SCORING (CLIP)
-# ------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_clip():
-    """Load CLIP once and cache it across sessions."""
     import open_clip
     import torch
     model, _, preprocess = open_clip.create_model_and_transforms(
@@ -238,89 +320,96 @@ def load_clip():
     return model, preprocess, tokenizer, torch
 
 
-def score_frames_with_clip(candidates: list, transcript: dict) -> list:
+def score_frames_for_sections(candidates: list, sections: list) -> list:
     """
-    For each candidate frame, find the transcript window around its
-    timestamp, then score image-vs-text similarity with CLIP.
+    Score each candidate frame against each section heading + paragraph.
+    Return list of (section_index, frame) with best CLIP score.
     """
     import torch
+    from PIL import Image as _I
 
     model, preprocess, tokenizer, _ = load_clip()
-
-    segments = transcript.get("segments", [])
-    if not segments or not candidates:
+    if not candidates or not sections:
         return []
 
-    def text_around(ts: float, window: float = 10.0) -> str:
-        chunks = [
-            s["text"] for s in segments
-            if s["start"] <= ts + window and s["end"] >= ts - window
-        ]
-        text = " ".join(chunks).strip()
-        return text if text else transcript.get("text", "")[:300]
+    # Build a query string per section (heading + first 30 words of paragraph)
+    section_queries = []
+    for sec in sections:
+        heading = sec.get("heading", "").strip()
+        para = sec.get("paragraph", "").strip()
+        text = f"{heading}. {para}"[:250]
+        section_queries.append(text if text else "training video content")
 
     results = []
     with torch.no_grad():
         for cand in candidates:
-            text = text_around(cand["timestamp"])
-            if not text:
+            try:
+                image = preprocess(_I.open(cand["path"]).convert("RGB")).unsqueeze(0)
+                img_feat = model.encode_image(image)
+                img_feat /= img_feat.norm(dim=-1, keepdim=True)
+            except Exception:
                 continue
 
-            image = preprocess(Image.open(cand["path"]).convert("RGB")).unsqueeze(0)
-            tokens = tokenizer([text])
-
-            img_feat = model.encode_image(image)
+            tokens = tokenizer(section_queries)
             txt_feat = model.encode_text(tokens)
-
-            img_feat /= img_feat.norm(dim=-1, keepdim=True)
             txt_feat /= txt_feat.norm(dim=-1, keepdim=True)
 
-            score = float((img_feat @ txt_feat.T).item())
+            sims = (img_feat @ txt_feat.T).squeeze(0).cpu().numpy()
 
-            results.append({
-                "timestamp": cand["timestamp"],
-                "path": cand["path"],
-                "score": score,
-                "context": text,
-            })
+            for sec_idx, sim in enumerate(sims):
+                results.append({
+                    "section_index": sec_idx,
+                    "timestamp": cand["timestamp"],
+                    "path": cand["path"],
+                    "score": float(sim),
+                })
 
     return results
 
 
-def select_best_frames(scored: list, max_n: int) -> list:
-    """Pick top-N frames, spread over time."""
+def pick_screenshot_per_section(scored: list, num_sections: int,
+                                 max_total: int) -> dict:
+    """
+    For each section, pick the best-scoring frame whose timestamp is
+    >= the section start time and < next section start time.
+    Returns {section_index: frame_dict}.
+    """
     if not scored:
-        return []
+        return {}
 
-    scored = sorted(scored, key=lambda x: x["score"], reverse=True)
+    # Sort candidates by score, group by section
+    by_section = {}
+    for item in scored:
+        by_section.setdefault(item["section_index"], []).append(item)
 
-    selected = []
-    min_gap = 30.0
+    # Sort each group by score descending
+    for k in by_section:
+        by_section[k].sort(key=lambda x: x["score"], reverse=True)
 
-    for cand in scored:
-        if len(selected) >= max_n:
-            break
-        if all(abs(cand["timestamp"] - s["timestamp"]) >= min_gap for s in selected):
-            selected.append(cand)
+    # Global cap: if too many sections, drop the lowest-scoring picks
+    picks = {}
+    for sec_idx, items in by_section.items():
+        if items:
+            picks[sec_idx] = items[0]
 
-    if len(selected) < max_n:
-        for cand in scored:
-            if cand not in selected:
-                selected.append(cand)
-            if len(selected) >= max_n:
-                break
+    # Enforce max_total
+    if len(picks) > max_total:
+        sorted_picks = sorted(
+            picks.items(), key=lambda kv: kv[1]["score"], reverse=True,
+        )[:max_total]
+        picks = dict(sorted_picks)
 
-    return sorted(selected, key=lambda x: x["timestamp"])
+    return picks
 
 
 # ------------------------------------------------------------------
-# STEP 6 — PDF BUILD
+# PDF BUILD
 # ------------------------------------------------------------------
 class PDF(FPDF):
     def header(self):
         self.set_font("Helvetica", "B", 10)
         self.set_text_color(120, 120, 120)
-        self.cell(0, 8, "KT Session Transcript", align="R")
+        self.cell(0, 8, "Knowledge Transfer Document", align="R")
         self.ln(10)
 
     def footer(self):
@@ -334,111 +423,158 @@ def _safe(text: str) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
-def build_pdf(transcript, title, out_path, include_summary, screenshots):
+def _add_image_fitted(pdf: PDF, img_path: Path, max_w_mm: float = 150,
+                      max_h_mm: float = 90):
+    try:
+        img = Image.open(img_path)
+        w, h = img.size
+        ratio = h / w
+        img_w = max_w_mm
+        img_h = img_w * ratio
+        if img_h > max_h_mm:
+            img_h = max_h_mm
+            img_w = img_h / ratio
+        x = (pdf.w - img_w) / 2
+        pdf.image(str(img_path), x=x, w=img_w, h=img_h)
+        return True
+    except Exception as e:
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(200, 80, 80)
+        pdf.cell(0, 5, f"(Screenshot failed: {e})", ln=True)
+        return False
+
+
+def build_document_pdf(
+    doc: dict,
+    transcript: dict,
+    screenshots_by_section: dict,
+    out_path: Path,
+    include_transcript: bool,
+):
     pdf = PDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # ---- Cover ----
-    pdf.set_font("Helvetica", "B", 22)
+    # ---------- Cover ----------
+    pdf.set_font("Helvetica", "B", 24)
     pdf.set_text_color(0, 120, 212)
-    pdf.ln(30)
-    pdf.multi_cell(0, 12, _safe(title), align="C")
+    pdf.ln(35)
+    pdf.multi_cell(0, 12, _safe(doc.get("title", "Knowledge Transfer")),
+                   align="C")
 
-    pdf.ln(10)
+    pdf.ln(15)
     pdf.set_font("Helvetica", "", 11)
-    pdf.set_text_color(80, 80, 80)
-    pdf.cell(0, 8, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-             align="C", ln=True)
-    pdf.cell(0, 8, f"Duration: {format_timestamp(transcript.get('duration', 0))}",
-             align="C", ln=True)
-    pdf.cell(0, 8, f"Language: {transcript.get('language', 'unknown')}",
-             align="C", ln=True)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(
+        0, 8,
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        align="C", ln=True,
+    )
+    pdf.cell(
+        0, 8,
+        f"Source duration: {format_timestamp(transcript.get('duration', 0))}",
+        align="C", ln=True,
+    )
+    pdf.cell(
+        0, 8,
+        f"Language: {transcript.get('language', 'unknown')}",
+        align="C", ln=True,
+    )
 
-    # ---- Summary ----
-    if include_summary:
+    # ---------- Executive Summary ----------
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_text_color(0, 120, 212)
+    pdf.cell(0, 12, "Executive Summary", ln=True)
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(30, 30, 30)
+    pdf.multi_cell(0, 6, _safe(doc.get("executive_summary", "")))
+    pdf.ln(6)
+
+    # ---------- Sections ----------
+    for idx, section in enumerate(doc.get("sections", [])):
         pdf.add_page()
+        # Heading
         pdf.set_font("Helvetica", "B", 16)
         pdf.set_text_color(0, 120, 212)
-        pdf.cell(0, 10, "Summary", ln=True)
-        pdf.ln(4)
-        pdf.set_font("Helvetica", "", 11)
-        pdf.set_text_color(40, 40, 40)
-        segments = transcript.get("segments", [])
-        picks = []
-        if segments:
-            picks.append(segments[0])
-            if len(segments) > 2:
-                picks.append(segments[len(segments) // 2])
-            picks.append(segments[-1])
-        for seg in picks:
-            ts = format_timestamp(seg.get("start", 0))
-            pdf.set_font("Helvetica", "B", 10)
-            pdf.cell(0, 6, f"[{ts}]", ln=True)
-            pdf.set_font("Helvetica", "", 11)
-            pdf.multi_cell(0, 6, _safe(seg.get("text", "").strip()))
-            pdf.ln(2)
+        heading = section.get("heading", f"Section {idx + 1}")
+        pdf.multi_cell(0, 9, _safe(heading))
+        pdf.ln(1)
 
-    # ---- Full transcript with screenshots ----
-    pdf.add_page()
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.set_text_color(0, 120, 212)
-    pdf.cell(0, 10, "Full Transcript", ln=True)
-    pdf.ln(4)
+        # Timestamp
+        ts = section.get("timestamp", 0)
+        pdf.set_font("Helvetica", "I", 9)
+        pdf.set_text_color(140, 140, 140)
+        pdf.cell(0, 5, f"@ {format_timestamp(ts)}", ln=True)
+        pdf.ln(3)
 
-    segments = transcript.get("segments", [])
-
-    # Map: segment id → screenshot
-    shots_by_seg = {}
-    if screenshots and segments:
-        for shot in screenshots:
-            nearest = min(
-                segments,
-                key=lambda s: abs(s["start"] - shot["timestamp"]),
-            )
-            shots_by_seg[id(nearest)] = shot
-
-    for seg in segments:
-        ts = format_timestamp(seg.get("start", 0))
-        text = _safe(seg.get("text", "").strip())
-
-        shot = shots_by_seg.get(id(seg))
+        # Screenshot (if picked for this section)
+        shot = screenshots_by_section.get(idx)
         if shot:
-            try:
-                img = Image.open(shot["path"])
-                max_w_mm = 160
-                w, h = img.size
-                ratio = h / w
-                img_w = max_w_mm
-                img_h = img_w * ratio
-                if img_h > 90:
-                    img_h = 90
-                    img_w = img_h / ratio
+            pdf.set_font("Helvetica", "I", 8)
+            pdf.set_text_color(140, 140, 140)
+            pdf.cell(
+                0, 5,
+                f"Screenshot @ {format_timestamp(shot['timestamp'])} "
+                f"(relevance {shot['score']:.2f})",
+                ln=True,
+            )
+            _add_image_fitted(pdf, shot["path"], max_w_mm=150, max_h_mm=80)
+            pdf.ln(5)
 
-                pdf.ln(2)
-                pdf.set_font("Helvetica", "I", 8)
-                pdf.set_text_color(120, 120, 120)
-                pdf.cell(
-                    0, 5,
-                    f"Screenshot @ {format_timestamp(shot['timestamp'])} "
-                    f"(relevance {shot['score']:.2f})",
-                    ln=True,
-                )
-                x = (pdf.w - img_w) / 2
-                pdf.image(str(shot["path"]), x=x, w=img_w, h=img_h)
-                pdf.ln(3)
-            except Exception as e:
-                pdf.set_font("Helvetica", "I", 8)
-                pdf.set_text_color(200, 80, 80)
-                pdf.cell(0, 5, f"(Screenshot failed: {e})", ln=True)
-
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.set_text_color(0, 120, 212)
-        pdf.cell(22, 6, f"[{ts}]", ln=False)
+        # Paragraph
         pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(30, 30, 30)
-        pdf.multi_cell(0, 6, text)
-        pdf.ln(1)
+        pdf.multi_cell(0, 6, _safe(section.get("paragraph", "")))
+        pdf.ln(4)
+
+        # Bullets
+        bullets = section.get("bullets", [])
+        if bullets:
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.set_text_color(60, 60, 60)
+            pdf.cell(0, 6, "Key points:", ln=True)
+            pdf.set_font("Helvetica", "", 10)
+            pdf.set_text_color(40, 40, 40)
+            for b in bullets:
+                pdf.multi_cell(0, 5.5, _safe(f"  •  {b}"))
+            pdf.ln(2)
+
+    # ---------- Key Takeaways ----------
+    takeaways = doc.get("key_takeaways", [])
+    if takeaways:
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 18)
+        pdf.set_text_color(0, 120, 212)
+        pdf.cell(0, 12, "Key Takeaways", ln=True)
+        pdf.ln(3)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.set_text_color(30, 30, 30)
+        for t in takeaways:
+            pdf.multi_cell(0, 6, _safe(f"  •  {t}"))
+            pdf.ln(2)
+
+    # ---------- Optional Transcript Appendix ----------
+    if include_transcript:
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 18)
+        pdf.set_text_color(0, 120, 212)
+        pdf.cell(0, 12, "Appendix: Full Transcript", ln=True)
+        pdf.ln(3)
+
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(30, 30, 30)
+        for seg in transcript.get("segments", []):
+            ts = format_timestamp(seg.get("start", 0))
+            text = _safe(seg.get("text", "").strip())
+            pdf.set_font("Helvetica", "B", 8)
+            pdf.set_text_color(0, 120, 212)
+            pdf.cell(20, 5, f"[{ts}]", ln=False)
+            pdf.set_font("Helvetica", "", 10)
+            pdf.set_text_color(30, 30, 30)
+            pdf.multi_cell(0, 5.5, text)
+            pdf.ln(0.5)
 
     pdf.output(str(out_path))
 
@@ -447,6 +583,10 @@ def build_pdf(transcript, title, out_path, include_summary, screenshots):
 # ORCHESTRATION
 # ------------------------------------------------------------------
 if generate and uploaded_file:
+    if not openai_api_key:
+        st.error("Please provide an OpenAI API key in the sidebar.")
+        st.stop()
+
     status = st.status("Starting pipeline...", expanded=True)
     try:
         # 1. Save
@@ -454,7 +594,7 @@ if generate and uploaded_file:
         media_path = save_upload(uploaded_file)
         status.write(f"✅ Saved ({media_path.stat().st_size / 1e6:.1f} MB)")
 
-        # 2. Extract audio
+        # 2. Audio
         status.write("🎧 Extracting audio...")
         audio_path = extract_audio(media_path)
         status.write("✅ Audio extracted")
@@ -464,50 +604,80 @@ if generate and uploaded_file:
         transcript = transcribe(audio_path, whisper_model)
         status.write(f"✅ Transcribed {len(transcript.get('segments', []))} segments")
 
-        # 4. Screenshots
-        screenshots = []
+        # 4. LLM structuring
+        status.write(f"🤖 Structuring document with {llm_model}...")
+        doc = structure_with_llm(transcript, openai_api_key, llm_model)
+        status.write(
+            f"✅ Generated {len(doc.get('sections', []))} sections: "
+            f"{doc.get('title', 'Untitled')}"
+        )
+
+        # 5. Screenshots
+        screenshots_by_section = {}
         if include_screenshots:
             is_video = media_path.suffix.lower() in [
                 ".mp4", ".mov", ".mkv", ".webm", ".avi"
             ]
             if not is_video:
-                status.write("ℹ️ Uploaded file is audio-only; skipping screenshots.")
+                status.write("ℹ️ Audio-only upload; skipping screenshots.")
             else:
                 status.write("🎞️ Detecting scene changes...")
                 candidates = extract_candidate_frames(media_path, scene_threshold)
                 status.write(f"✅ Found {len(candidates)} candidate frames")
 
                 if candidates:
-                    status.write("🤖 Scoring frames with CLIP (AI)...")
-                    scored = score_frames_with_clip(candidates, transcript)
-                    screenshots = select_best_frames(scored, num_screenshots)
+                    status.write("🎯 Scoring frames against sections...")
+                    scored = score_frames_for_sections(
+                        candidates, doc.get("sections", [])
+                    )
+                    screenshots_by_section = pick_screenshot_per_section(
+                        scored,
+                        num_sections=len(doc.get("sections", [])),
+                        max_total=num_screenshots,
+                    )
                     status.write(
-                        f"✅ Selected {len(screenshots)} relevant screenshots"
+                        f"✅ Picked screenshots for "
+                        f"{len(screenshots_by_section)} sections"
                     )
 
-                    if screenshots:
-                        st.subheader("🎯 AI-Selected Screenshots")
-                        cols = st.columns(min(len(screenshots), 3))
-                        for i, s in enumerate(screenshots):
-                            with cols[i % 3]:
+                    # Preview
+                    if screenshots_by_section:
+                        st.subheader("🎯 Screenshots Attached to Sections")
+                        for sec_idx, shot in sorted(
+                            screenshots_by_section.items()
+                        ):
+                            heading = doc["sections"][sec_idx].get(
+                                "heading", f"Section {sec_idx + 1}"
+                            )
+                            col1, col2 = st.columns([1, 2])
+                            with col1:
                                 st.image(
-                                    str(s["path"]),
+                                    str(shot["path"]),
                                     caption=(
-                                        f"{format_timestamp(s['timestamp'])} "
-                                        f"(score {s['score']:.2f})"
+                                        f"@ {format_timestamp(shot['timestamp'])} "
+                                        f"(score {shot['score']:.2f})"
                                     ),
                                     use_column_width=True,
                                 )
+                            with col2:
+                                st.markdown(f"**{heading}**")
+                                st.caption(
+                                    doc["sections"][sec_idx].get(
+                                        "paragraph", ""
+                                    )[:200] + "..."
+                                )
 
-        # 5. Build PDF
-        status.write("📄 Building PDF...")
-        title = Path(uploaded_file.name).stem.replace("_", " ").replace("-", " ")
-        pdf_path = WORKDIR / "KT_Transcript.pdf"
-        build_pdf(transcript, title, pdf_path, include_summary, screenshots)
+        # 6. Build PDF
+        status.write("📄 Building document PDF...")
+        pdf_path = WORKDIR / "KT_Document.pdf"
+        build_document_pdf(
+            doc, transcript, screenshots_by_section, pdf_path,
+            include_transcript,
+        )
         status.write("✅ PDF generated")
 
         status.update(label="Pipeline complete ✅", state="complete")
-        st.success("PDF is ready!")
+        st.success("Document ready!")
 
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
@@ -515,7 +685,10 @@ if generate and uploaded_file:
         st.download_button(
             label="⬇️ Download PDF",
             data=pdf_bytes,
-            file_name=f"KT_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+            file_name=(
+                f"KT_Document_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+            ),
             mime="application/pdf",
             use_container_width=True,
         )
@@ -524,7 +697,7 @@ if generate and uploaded_file:
         b64 = base64.b64encode(pdf_bytes).decode()
         st.markdown(
             f'<iframe src="data:application/pdf;base64,{b64}" '
-            f'width="100%" height="700" type="application/pdf"></iframe>',
+            f'width="100%" height="800" type="application/pdf"></iframe>',
             unsafe_allow_html=True,
         )
 
