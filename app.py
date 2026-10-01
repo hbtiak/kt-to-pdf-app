@@ -6,6 +6,7 @@ Upload a video → transcript → Gemini structures it into headings/paragraphs
 
 import os
 import json
+import time
 import subprocess
 import tempfile
 from pathlib import Path
@@ -65,16 +66,13 @@ with st.sidebar:
     gemini_api_key = st.text_input(
         "Gemini API Key",
         type="password",
-        help=(
-            "Get a free key at https://aistudio.google.com/apikey . "
-            "Key must start with 'AIza...' (not 'AQ...')."
-        ),
+        help="Get a free key at https://aistudio.google.com/apikey",
     )
     llm_model = st.selectbox(
         "Gemini model",
         ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"],
         index=0,
-        help="Gemini 3.8 Flash is the latest model with improved reasoning.",
+        help="Gemini 3.8 Flash is the latest Flash model (GA).",
     )
 
     st.divider()
@@ -199,7 +197,7 @@ def transcribe(audio_path: Path, model_size: str) -> dict:
 
 
 # ------------------------------------------------------------------
-# GEMINI: STRUCTURE TRANSCRIPT INTO A DOCUMENT
+# GEMINI: STRUCTURE TRANSCRIPT INTO A DOCUMENT (with retry)
 # ------------------------------------------------------------------
 STRUCTURE_PROMPT = """You are an expert technical writer. You will receive a raw transcript of a training/knowledge-transfer video.
 
@@ -233,8 +231,10 @@ Do not include markdown, code fences, or any text outside the JSON.
 """
 
 
-def structure_with_llm(transcript: dict, api_key: str, model: str) -> dict:
-    """Call Gemini (via OpenAI-compatible endpoint) to structure the transcript."""
+def structure_with_llm(
+    transcript: dict, api_key: str, model: str, max_retries: int = 3
+) -> dict:
+    """Call Gemini (via OpenAI-compatible endpoint) with retry on 503/429."""
     from openai import OpenAI
 
     # Build timestamped transcript
@@ -247,32 +247,60 @@ def structure_with_llm(transcript: dict, api_key: str, model: str) -> dict:
     if len(transcript_with_ts) > 60_000:
         transcript_with_ts = transcript_with_ts[:60_000] + "\n[...truncated...]"
 
-    # ---- KEY FIX: point the client at Google's OpenAI-compatible endpoint ----
     client = OpenAI(
         api_key=api_key,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
     )
 
-    with st.spinner(f"Structuring document with {model}..."):
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": STRUCTURE_PROMPT},
-                {"role": "user", "content": transcript_with_ts},
-            ],
-            temperature=0.3,
-            response_format={"type": "json_object"},
-        )
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            with st.spinner(
+                f"Structuring document with {model}... "
+                f"(attempt {attempt + 1}/{max_retries})"
+            ):
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": STRUCTURE_PROMPT},
+                        {"role": "user", "content": transcript_with_ts},
+                    ],
+                    temperature=0.3,
+                    response_format={"type": "json_object"},
+                )
 
-    raw = resp.choices[0].message.content
-    try:
-        doc = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"LLM returned invalid JSON: {e}\n\nRaw: {raw[:500]}")
+            raw = resp.choices[0].message.content
+            try:
+                doc = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"LLM returned invalid JSON: {e}\n\nRaw: {raw[:500]}"
+                )
 
-    if "sections" not in doc or not isinstance(doc["sections"], list):
-        raise RuntimeError("LLM response missing 'sections' array.")
-    return doc
+            if "sections" not in doc or not isinstance(doc["sections"], list):
+                raise RuntimeError("LLM response missing 'sections' array.")
+            return doc
+
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            if (
+                "503" in error_str
+                or "429" in error_str
+                or "UNAVAILABLE" in error_str
+                or "high demand" in error_str
+            ):
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 5  # 5s, 10s, 20s
+                    st.warning(
+                        f"Gemini is busy (503). Waiting {wait_time}s "
+                        f"before retry {attempt + 2}/{max_retries}..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+            raise
+
+    raise last_error
 
 
 # ------------------------------------------------------------------
@@ -345,7 +373,9 @@ def score_frames_for_sections(candidates: list, sections: list) -> list:
     with torch.no_grad():
         for cand in candidates:
             try:
-                image = preprocess(_I.open(cand["path"]).convert("RGB")).unsqueeze(0)
+                image = preprocess(
+                    _I.open(cand["path"]).convert("RGB")
+                ).unsqueeze(0)
                 img_feat = model.encode_image(image)
                 img_feat /= img_feat.norm(dim=-1, keepdim=True)
             except Exception:
@@ -368,8 +398,9 @@ def score_frames_for_sections(candidates: list, sections: list) -> list:
     return results
 
 
-def pick_screenshot_per_section(scored: list, num_sections: int,
-                                max_total: int) -> dict:
+def pick_screenshot_per_section(
+    scored: list, num_sections: int, max_total: int
+) -> dict:
     """Pick best-scoring frame for each section, cap at max_total."""
     if not scored:
         return {}
@@ -416,8 +447,9 @@ def _safe(text: str) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
-def _add_image_fitted(pdf: PDF, img_path: Path, max_w_mm: float = 150,
-                      max_h_mm: float = 90):
+def _add_image_fitted(
+    pdf: PDF, img_path: Path, max_w_mm: float = 150, max_h_mm: float = 90
+):
     try:
         img = Image.open(img_path)
         w, h = img.size
@@ -452,8 +484,9 @@ def build_document_pdf(
     pdf.set_font("Helvetica", "B", 24)
     pdf.set_text_color(0, 120, 212)
     pdf.ln(35)
-    pdf.multi_cell(0, 12, _safe(doc.get("title", "Knowledge Transfer")),
-                   align="C")
+    pdf.multi_cell(
+        0, 12, _safe(doc.get("title", "Knowledge Transfer")), align="C"
+    )
 
     pdf.ln(15)
     pdf.set_font("Helvetica", "", 11)
@@ -588,11 +621,15 @@ if generate and uploaded_file:
         # 3. Transcribe
         status.write(f"📝 Transcribing with Whisper '{whisper_model}'...")
         transcript = transcribe(audio_path, whisper_model)
-        status.write(f"✅ Transcribed {len(transcript.get('segments', []))} segments")
+        status.write(
+            f"✅ Transcribed {len(transcript.get('segments', []))} segments"
+        )
 
-        # 4. LLM structuring
+        # 4. LLM structuring (with retry on 503)
         status.write(f"🤖 Structuring document with {llm_model}...")
-        doc = structure_with_llm(transcript, gemini_api_key, llm_model)
+        doc = structure_with_llm(
+            transcript, gemini_api_key, llm_model, max_retries=3
+        )
         status.write(
             f"✅ Generated {len(doc.get('sections', []))} sections: "
             f"{doc.get('title', 'Untitled')}"
@@ -608,7 +645,9 @@ if generate and uploaded_file:
                 status.write("ℹ️ Audio-only upload; skipping screenshots.")
             else:
                 status.write("🎞️ Detecting scene changes...")
-                candidates = extract_candidate_frames(media_path, scene_threshold)
+                candidates = extract_candidate_frames(
+                    media_path, scene_threshold
+                )
                 status.write(f"✅ Found {len(candidates)} candidate frames")
 
                 if candidates:
