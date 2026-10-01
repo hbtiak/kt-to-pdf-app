@@ -469,6 +469,19 @@ def _safe(text: str) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
+def _soft_wrap(text: str, max_word_len: int = 40) -> str:
+    """Break very long words with spaces so FPDF can wrap them."""
+    result = []
+    for word in text.split():
+        if len(word) > max_word_len:
+            word = " ".join(
+                word[i:i + max_word_len]
+                for i in range(0, len(word), max_word_len)
+            )
+        result.append(word)
+    return " ".join(result)
+
+
 def _add_image_fitted(
     pdf: PDF, img_path: Path, max_w_mm: float = 150, max_h_mm: float = 90
 ):
@@ -487,6 +500,7 @@ def _add_image_fitted(
     except Exception as e:
         pdf.set_font("Helvetica", "I", 8)
         pdf.set_text_color(200, 80, 80)
+        pdf.set_x(pdf.l_margin)
         pdf.cell(0, 5, f"(Screenshot failed: {e})", ln=True)
         return False
 
@@ -502,10 +516,11 @@ def build_document_pdf(
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # Cover
+    # ---------- Cover ----------
     pdf.set_font("Helvetica", "B", 24)
     pdf.set_text_color(0, 120, 212)
     pdf.ln(35)
+    pdf.set_x(pdf.l_margin)
     pdf.multi_cell(
         0, 12, _safe(doc.get("title", "Knowledge Transfer")), align="C"
     )
@@ -513,45 +528,54 @@ def build_document_pdf(
     pdf.ln(15)
     pdf.set_font("Helvetica", "", 11)
     pdf.set_text_color(100, 100, 100)
+    pdf.set_x(pdf.l_margin)
     pdf.cell(
         0, 8,
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         align="C", ln=True,
     )
+    pdf.set_x(pdf.l_margin)
     pdf.cell(
         0, 8,
         f"Source duration: {format_timestamp(transcript.get('duration', 0))}",
         align="C", ln=True,
     )
+    pdf.set_x(pdf.l_margin)
     pdf.cell(
         0, 8,
         f"Language: {transcript.get('language', 'unknown')}",
         align="C", ln=True,
     )
 
-    # Executive summary
+    # ---------- Executive Summary ----------
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 18)
     pdf.set_text_color(0, 120, 212)
+    pdf.set_x(pdf.l_margin)
     pdf.cell(0, 12, "Executive Summary", ln=True)
     pdf.ln(2)
     pdf.set_font("Helvetica", "", 11)
     pdf.set_text_color(30, 30, 30)
-    pdf.multi_cell(0, 6, _safe(doc.get("executive_summary", "")))
+    pdf.set_x(pdf.l_margin)
+    pdf.multi_cell(
+        0, 6, _safe(_soft_wrap(doc.get("executive_summary", "")))
+    )
     pdf.ln(6)
 
-    # Sections
+    # ---------- Sections ----------
     for idx, section in enumerate(doc.get("sections", [])):
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 16)
         pdf.set_text_color(0, 120, 212)
         heading = section.get("heading", f"Section {idx + 1}")
-        pdf.multi_cell(0, 9, _safe(heading))
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(0, 9, _safe(_soft_wrap(heading)))
         pdf.ln(1)
 
         ts = section.get("timestamp", 0)
         pdf.set_font("Helvetica", "I", 9)
         pdf.set_text_color(140, 140, 140)
+        pdf.set_x(pdf.l_margin)
         pdf.cell(0, 5, f"@ {format_timestamp(ts)}", ln=True)
         pdf.ln(3)
 
@@ -559,6 +583,7 @@ def build_document_pdf(
         if shot:
             pdf.set_font("Helvetica", "I", 8)
             pdf.set_text_color(140, 140, 140)
+            pdf.set_x(pdf.l_margin)
             pdf.cell(
                 0, 5,
                 f"Screenshot @ {format_timestamp(shot['timestamp'])} "
@@ -570,47 +595,60 @@ def build_document_pdf(
 
         pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(30, 30, 30)
-        pdf.multi_cell(0, 6, _safe(section.get("paragraph", "")))
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(
+            0, 6,
+            _safe(_soft_wrap(section.get("paragraph", "")))
+        )
         pdf.ln(4)
 
         bullets = section.get("bullets", [])
         if bullets:
             pdf.set_font("Helvetica", "B", 11)
             pdf.set_text_color(60, 60, 60)
+            pdf.set_x(pdf.l_margin)
             pdf.cell(0, 6, "Key points:", ln=True)
             pdf.set_font("Helvetica", "", 10)
             pdf.set_text_color(40, 40, 40)
             for b in bullets:
-                pdf.multi_cell(0, 5.5, _safe(f"  -  {b}"))
+                pdf.set_x(pdf.l_margin)  # critical fix
+                pdf.multi_cell(
+                    0, 5.5,
+                    _safe(_soft_wrap(f"  -  {b}"))
+                )
             pdf.ln(2)
 
-    # Key takeaways
+    # ---------- Key Takeaways ----------
     takeaways = doc.get("key_takeaways", [])
     if takeaways:
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 18)
         pdf.set_text_color(0, 120, 212)
+        pdf.set_x(pdf.l_margin)
         pdf.cell(0, 12, "Key Takeaways", ln=True)
         pdf.ln(3)
         pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(30, 30, 30)
         for t in takeaways:
-            pdf.multi_cell(0, 6, _safe(f"  -  {t}"))
+            pdf.set_x(pdf.l_margin)  # critical fix
+            pdf.multi_cell(0, 6, _safe(_soft_wrap(f"  -  {t}")))
             pdf.ln(2)
 
-    # Optional transcript appendix
+    # ---------- Transcript Appendix ----------
     if include_transcript:
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 18)
         pdf.set_text_color(0, 120, 212)
+        pdf.set_x(pdf.l_margin)
         pdf.cell(0, 12, "Appendix: Full Transcript", ln=True)
         pdf.ln(3)
 
         for seg in transcript.get("segments", []):
             ts = format_timestamp(seg.get("start", 0))
-            text = _safe(seg.get("text", "").strip())
+            text = _safe(_soft_wrap(seg.get("text", "").strip()))
             pdf.set_font("Helvetica", "B", 8)
             pdf.set_text_color(0, 120, 212)
+            pdf.set_x(pdf.l_margin)
             pdf.cell(20, 5, f"[{ts}]", ln=False)
             pdf.set_font("Helvetica", "", 10)
             pdf.set_text_color(30, 30, 30)
@@ -647,7 +685,7 @@ if generate and uploaded_file:
             f"✅ Transcribed {len(transcript.get('segments', []))} segments"
         )
 
-        # 4. LLM structuring (with timeout + retry)
+        # 4. LLM structuring
         status.write(f"🤖 Structuring document with {llm_model}...")
         doc = structure_with_llm(
             transcript, gemini_api_key, llm_model, max_retries=3
