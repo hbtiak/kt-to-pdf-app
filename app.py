@@ -1,6 +1,6 @@
 """
 KT Recording → Structured Document PDF
-Upload a video → transcript → LLM structures it into headings/paragraphs
+Upload a video → transcript → Gemini structures it into headings/paragraphs
 → CLIP picks relevant screenshots → PDF with optional transcript appendix.
 """
 
@@ -37,7 +37,7 @@ _fix_execstack_for("ctranslate2")
 import base64
 import streamlit as st
 from fpdf import FPDF
-from PIL import Image, ImageFilter
+from PIL import Image
 import numpy as np
 
 # ------------------------------------------------------------------
@@ -51,7 +51,7 @@ st.set_page_config(
 
 st.title("📄 KT Recording → Structured Document")
 st.caption(
-    "Upload a recording. The app transcribes it, uses AI to structure it "
+    "Upload a recording. The app transcribes it, uses Gemini to structure it "
     "into headings and paragraphs, adds relevant screenshots, and generates a PDF."
 )
 
@@ -61,17 +61,20 @@ st.caption(
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    st.subheader("LLM")
-    openai_api_key = st.text_input(
-        "OpenAI API Key",
+    st.subheader("LLM (Gemini Free Tier)")
+    gemini_api_key = st.text_input(
+        "Gemini API Key",
         type="password",
-        help="Used to structure the transcript into a document. Get one at platform.openai.com",
+        help=(
+            "Get a free key at https://aistudio.google.com/apikey . "
+            "Key must start with 'AIza...' (not 'AQ...')."
+        ),
     )
     llm_model = st.selectbox(
-        "LLM model",
-        ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"],
+        "Gemini model",
+        ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
         index=0,
-        help="gpt-4o-mini is fast and cheap (~$0.02 per document).",
+        help="'flash' is fast and free-tier friendly.",
     )
 
     st.divider()
@@ -196,34 +199,34 @@ def transcribe(audio_path: Path, model_size: str) -> dict:
 
 
 # ------------------------------------------------------------------
-# LLM: STRUCTURE TRANSCRIPT INTO A DOCUMENT
+# GEMINI: STRUCTURE TRANSCRIPT INTO A DOCUMENT
 # ------------------------------------------------------------------
 STRUCTURE_PROMPT = """You are an expert technical writer. You will receive a raw transcript of a training/knowledge-transfer video.
 
 Your job: convert it into a well-structured document that a reader can skim and understand.
 
 RULES:
-1. Identify 3–7 main topics covered in the transcript. These become SECTION HEADINGS.
-2. For each section, write a clear 2–4 sentence paragraph in your own words summarizing what was said. Do NOT copy-paste; synthesize.
-3. Under each section, add 2–4 bullet points of key facts, definitions, or examples mentioned.
-4. Add a short Executive Summary (3–5 sentences) at the top.
-5. Add a "Key Takeaways" section at the end (3–5 bullets).
-6. Include a "timestamp" field for each section — the start time (in seconds) where that topic begins in the video. This is used to attach screenshots.
+1. Identify 3-7 main topics covered in the transcript. These become SECTION HEADINGS.
+2. For each section, write a clear 2-4 sentence paragraph in your own words summarizing what was said. Do NOT copy-paste; synthesize.
+3. Under each section, add 2-4 bullet points of key facts, definitions, or examples mentioned.
+4. Add a short Executive Summary (3-5 sentences) at the top.
+5. Add a "Key Takeaways" section at the end (3-5 bullets).
+6. Include a "timestamp" field for each section - the start time (in seconds) where that topic begins in the video. This is used to attach screenshots.
 
 Return ONLY valid JSON, matching this schema exactly:
 
 {
-  "title": "string — concise title for the document",
-  "executive_summary": "string — 3–5 sentences",
+  "title": "string - concise title for the document",
+  "executive_summary": "string - 3-5 sentences",
   "sections": [
     {
       "heading": "string",
       "timestamp": number,
-      "paragraph": "string — 2–4 sentences",
-      "bullets": ["string", "string", ...]
+      "paragraph": "string - 2-4 sentences",
+      "bullets": ["string", "string", "..."]
     }
   ],
-  "key_takeaways": ["string", ...]
+  "key_takeaways": ["string", "..."]
 }
 
 Do not include markdown, code fences, or any text outside the JSON.
@@ -231,21 +234,24 @@ Do not include markdown, code fences, or any text outside the JSON.
 
 
 def structure_with_llm(transcript: dict, api_key: str, model: str) -> dict:
-    """Call LLM to convert raw transcript into structured JSON."""
+    """Call Gemini (via OpenAI-compatible endpoint) to structure the transcript."""
     from openai import OpenAI
 
-    # Build timestamped transcript text (with times so LLM can pick section starts)
+    # Build timestamped transcript
     lines = []
     for seg in transcript.get("segments", []):
         ts = format_timestamp(seg.get("start", 0))
         lines.append(f"[{ts}] {seg['text'].strip()}")
     transcript_with_ts = "\n".join(lines)
 
-    # Cap input size to avoid token limits (~15k chars ≈ 4k tokens)
     if len(transcript_with_ts) > 60_000:
         transcript_with_ts = transcript_with_ts[:60_000] + "\n[...truncated...]"
 
-    client = OpenAI(api_key=api_key)
+    # ---- KEY FIX: point the client at Google's OpenAI-compatible endpoint ----
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
 
     with st.spinner(f"Structuring document with {model}..."):
         resp = client.chat.completions.create(
@@ -264,7 +270,6 @@ def structure_with_llm(transcript: dict, api_key: str, model: str) -> dict:
     except json.JSONDecodeError as e:
         raise RuntimeError(f"LLM returned invalid JSON: {e}\n\nRaw: {raw[:500]}")
 
-    # Basic schema validation
     if "sections" not in doc or not isinstance(doc["sections"], list):
         raise RuntimeError("LLM response missing 'sections' array.")
     return doc
@@ -321,10 +326,7 @@ def load_clip():
 
 
 def score_frames_for_sections(candidates: list, sections: list) -> list:
-    """
-    Score each candidate frame against each section heading + paragraph.
-    Return list of (section_index, frame) with best CLIP score.
-    """
+    """Score each candidate frame against each section heading + paragraph."""
     import torch
     from PIL import Image as _I
 
@@ -332,7 +334,6 @@ def score_frames_for_sections(candidates: list, sections: list) -> list:
     if not candidates or not sections:
         return []
 
-    # Build a query string per section (heading + first 30 words of paragraph)
     section_queries = []
     for sec in sections:
         heading = sec.get("heading", "").strip()
@@ -368,31 +369,23 @@ def score_frames_for_sections(candidates: list, sections: list) -> list:
 
 
 def pick_screenshot_per_section(scored: list, num_sections: int,
-                                 max_total: int) -> dict:
-    """
-    For each section, pick the best-scoring frame whose timestamp is
-    >= the section start time and < next section start time.
-    Returns {section_index: frame_dict}.
-    """
+                                max_total: int) -> dict:
+    """Pick best-scoring frame for each section, cap at max_total."""
     if not scored:
         return {}
 
-    # Sort candidates by score, group by section
     by_section = {}
     for item in scored:
         by_section.setdefault(item["section_index"], []).append(item)
 
-    # Sort each group by score descending
     for k in by_section:
         by_section[k].sort(key=lambda x: x["score"], reverse=True)
 
-    # Global cap: if too many sections, drop the lowest-scoring picks
     picks = {}
     for sec_idx, items in by_section.items():
         if items:
             picks[sec_idx] = items[0]
 
-    # Enforce max_total
     if len(picks) > max_total:
         sorted_picks = sorted(
             picks.items(), key=lambda kv: kv[1]["score"], reverse=True,
@@ -455,7 +448,7 @@ def build_document_pdf(
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # ---------- Cover ----------
+    # Cover
     pdf.set_font("Helvetica", "B", 24)
     pdf.set_text_color(0, 120, 212)
     pdf.ln(35)
@@ -481,7 +474,7 @@ def build_document_pdf(
         align="C", ln=True,
     )
 
-    # ---------- Executive Summary ----------
+    # Executive summary
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 18)
     pdf.set_text_color(0, 120, 212)
@@ -492,24 +485,21 @@ def build_document_pdf(
     pdf.multi_cell(0, 6, _safe(doc.get("executive_summary", "")))
     pdf.ln(6)
 
-    # ---------- Sections ----------
+    # Sections
     for idx, section in enumerate(doc.get("sections", [])):
         pdf.add_page()
-        # Heading
         pdf.set_font("Helvetica", "B", 16)
         pdf.set_text_color(0, 120, 212)
         heading = section.get("heading", f"Section {idx + 1}")
         pdf.multi_cell(0, 9, _safe(heading))
         pdf.ln(1)
 
-        # Timestamp
         ts = section.get("timestamp", 0)
         pdf.set_font("Helvetica", "I", 9)
         pdf.set_text_color(140, 140, 140)
         pdf.cell(0, 5, f"@ {format_timestamp(ts)}", ln=True)
         pdf.ln(3)
 
-        # Screenshot (if picked for this section)
         shot = screenshots_by_section.get(idx)
         if shot:
             pdf.set_font("Helvetica", "I", 8)
@@ -523,13 +513,11 @@ def build_document_pdf(
             _add_image_fitted(pdf, shot["path"], max_w_mm=150, max_h_mm=80)
             pdf.ln(5)
 
-        # Paragraph
         pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(30, 30, 30)
         pdf.multi_cell(0, 6, _safe(section.get("paragraph", "")))
         pdf.ln(4)
 
-        # Bullets
         bullets = section.get("bullets", [])
         if bullets:
             pdf.set_font("Helvetica", "B", 11)
@@ -538,10 +526,10 @@ def build_document_pdf(
             pdf.set_font("Helvetica", "", 10)
             pdf.set_text_color(40, 40, 40)
             for b in bullets:
-                pdf.multi_cell(0, 5.5, _safe(f"  •  {b}"))
+                pdf.multi_cell(0, 5.5, _safe(f"  -  {b}"))
             pdf.ln(2)
 
-    # ---------- Key Takeaways ----------
+    # Key takeaways
     takeaways = doc.get("key_takeaways", [])
     if takeaways:
         pdf.add_page()
@@ -552,10 +540,10 @@ def build_document_pdf(
         pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(30, 30, 30)
         for t in takeaways:
-            pdf.multi_cell(0, 6, _safe(f"  •  {t}"))
+            pdf.multi_cell(0, 6, _safe(f"  -  {t}"))
             pdf.ln(2)
 
-    # ---------- Optional Transcript Appendix ----------
+    # Optional transcript appendix
     if include_transcript:
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 18)
@@ -563,8 +551,6 @@ def build_document_pdf(
         pdf.cell(0, 12, "Appendix: Full Transcript", ln=True)
         pdf.ln(3)
 
-        pdf.set_font("Helvetica", "", 10)
-        pdf.set_text_color(30, 30, 30)
         for seg in transcript.get("segments", []):
             ts = format_timestamp(seg.get("start", 0))
             text = _safe(seg.get("text", "").strip())
@@ -583,8 +569,8 @@ def build_document_pdf(
 # ORCHESTRATION
 # ------------------------------------------------------------------
 if generate and uploaded_file:
-    if not openai_api_key:
-        st.error("Please provide an OpenAI API key in the sidebar.")
+    if not gemini_api_key:
+        st.error("Please provide a Gemini API key in the sidebar.")
         st.stop()
 
     status = st.status("Starting pipeline...", expanded=True)
@@ -606,7 +592,7 @@ if generate and uploaded_file:
 
         # 4. LLM structuring
         status.write(f"🤖 Structuring document with {llm_model}...")
-        doc = structure_with_llm(transcript, openai_api_key, llm_model)
+        doc = structure_with_llm(transcript, gemini_api_key, llm_model)
         status.write(
             f"✅ Generated {len(doc.get('sections', []))} sections: "
             f"{doc.get('title', 'Untitled')}"
@@ -640,7 +626,6 @@ if generate and uploaded_file:
                         f"{len(screenshots_by_section)} sections"
                     )
 
-                    # Preview
                     if screenshots_by_section:
                         st.subheader("🎯 Screenshots Attached to Sections")
                         for sec_idx, shot in sorted(
