@@ -58,6 +58,11 @@ st.caption(
 )
 
 # ------------------------------------------------------------------
+# HARDCODED KEY (POC only — move to st.secrets for production)
+# ------------------------------------------------------------------
+HARDCODED_GEMINI_KEY = "AQ.Ab8RN6LypXPQgjNn1g_VGqHGE7m8EYofW-hUr4s64ZGejSVl3A"
+
+# ------------------------------------------------------------------
 # SIDEBAR
 # ------------------------------------------------------------------
 with st.sidebar:
@@ -66,9 +71,15 @@ with st.sidebar:
     st.subheader("LLM (Gemini Free Tier)")
     gemini_api_key = st.text_input(
         "Gemini API Key",
+        value=HARDCODED_GEMINI_KEY,
         type="password",
-        help="Get a free key at https://aistudio.google.com/apikey",
+        help="Pre-filled for POC. Replace with st.secrets in production.",
     )
+    # Safety: if password field returns empty on first render,
+    # fall back to the hardcoded key so the pipeline still works.
+    if not gemini_api_key:
+        gemini_api_key = HARDCODED_GEMINI_KEY
+
     llm_model = st.selectbox(
         "Gemini model",
         [
@@ -283,7 +294,6 @@ def structure_with_llm(
                 f"Structuring with {model}... "
                 f"(attempt {attempt + 1}/{max_retries})"
             ):
-                # Run in a thread with a hard 90s timeout so hangs fail fast
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                     future = ex.submit(_make_call)
                     try:
@@ -313,7 +323,7 @@ def structure_with_llm(
                 "timed out", "Timeout", "overloaded",
             ])
             if retryable and attempt < max_retries - 1:
-                wait_time = (2 ** attempt) * 5  # 5s, 10s, 20s
+                wait_time = (2 ** attempt) * 5
                 st.warning(
                     f"Gemini is busy or hanging. Waiting {wait_time}s "
                     f"before retry {attempt + 2}/{max_retries}..."
@@ -611,7 +621,7 @@ def build_document_pdf(
             pdf.set_font("Helvetica", "", 10)
             pdf.set_text_color(40, 40, 40)
             for b in bullets:
-                pdf.set_x(pdf.l_margin)  # critical fix
+                pdf.set_x(pdf.l_margin)
                 pdf.multi_cell(
                     0, 5.5,
                     _safe(_soft_wrap(f"  -  {b}"))
@@ -630,7 +640,7 @@ def build_document_pdf(
         pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(30, 30, 30)
         for t in takeaways:
-            pdf.set_x(pdf.l_margin)  # critical fix
+            pdf.set_x(pdf.l_margin)
             pdf.multi_cell(0, 6, _safe(_soft_wrap(f"  -  {t}")))
             pdf.ln(2)
 
