@@ -66,7 +66,6 @@ with st.sidebar:
     st.subheader("LLM (Gemini Free Tier)")
     gemini_api_key = st.text_input(
         "Gemini API Key",
-        value="AQ.Ab8RN6LypXPQgjNn1g_VGqHGE7m8EYofW-hUr4s64ZGejSVl3A",
         type="password",
         help="Get a free key at https://aistudio.google.com/apikey",
     )
