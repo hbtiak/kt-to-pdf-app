@@ -72,9 +72,9 @@ with st.sidebar:
     )
     llm_model = st.selectbox(
         "Gemini model",
-        ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
+        ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"],
         index=0,
-        help="'flash' is fast and free-tier friendly.",
+        help="Gemini 3.8 Flash is the latest model with improved reasoning.",
     )
 
     st.divider()
