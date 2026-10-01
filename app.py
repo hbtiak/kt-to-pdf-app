@@ -1,11 +1,8 @@
 """
-Video → PDF Generator
-Downloads a YouTube video (or any yt-dlp-supported URL),
-transcribes it with faster-whisper, and generates a downloadable PDF.
+KT Recording → PDF Generator (Manual Upload)
+User uploads a video file, app transcribes it, generates a PDF.
 """
 
-import os
-import re
 import base64
 import tempfile
 import subprocess
@@ -16,129 +13,100 @@ import streamlit as st
 from fpdf import FPDF
 
 # ------------------------------------------------------------------
-# PAGE CONFIG — MUST BE THE FIRST STREAMLIT COMMAND
+# PAGE CONFIG — must be first Streamlit command
 # ------------------------------------------------------------------
 st.set_page_config(
-    page_title="Video → PDF",
+    page_title="KT Recording → PDF",
     page_icon="📄",
     layout="wide",
 )
 
-# ------------------------------------------------------------------
-# ONE-TIME SETUP: Ensure Deno JS runtime for yt-dlp
-# ------------------------------------------------------------------
-def _ensure_deno():
-    """Install Deno manually into a user-writable directory."""
-    deno_dir = Path.home() / ".deno" / "bin"
-    deno_bin = deno_dir / "deno"
-
-    if deno_bin.exists():
-        os.environ["PATH"] = str(deno_dir) + ":" + os.environ.get("PATH", "")
-        return
-
-    deno_dir.mkdir(parents=True, exist_ok=True)
-
-    # Download and extract Deno
-    subprocess.run(
-        f"curl -fsSL https://github.com/denoland/deno/releases/latest/download/"
-        f"deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip",
-        shell=True, check=False,
-    )
-    subprocess.run(
-        f"unzip -o /tmp/deno.zip -d {deno_dir}",
-        shell=True, check=False,
-    )
-    subprocess.run(f"chmod +x {deno_bin}", shell=True, check=False)
-
-    if deno_bin.exists():
-        os.environ["PATH"] = str(deno_dir) + ":" + os.environ.get("PATH", "")
-
-# Run Deno setup (it will NOT call st.* functions, so it's safe here)
-_ensure_deno()
-
-# ------------------------------------------------------------------
-# UI
-# ------------------------------------------------------------------
-st.title("📄 Video → PDF Generator")
+st.title("📄 KT Recording → PDF Generator")
 st.caption(
-    "Downloads a video via yt-dlp, transcribes it with Whisper, "
-    "and generates a downloadable PDF."
+    "Upload a KT recording (mp4, mp3, wav, m4a, mov), and the app will "
+    "transcribe it and generate a downloadable PDF."
 )
 
+# ------------------------------------------------------------------
+# SIDEBAR
+# ------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Configuration")
+
     whisper_model = st.selectbox(
         "Whisper model",
         ["tiny", "base", "small", "medium"],
         index=1,
         help="Larger = more accurate but slower. 'base' is good for CPU.",
     )
+
     include_summary = st.checkbox("Include summary page", value=True)
+
     st.divider()
-    st.markdown("**Supported URLs**")
+    st.markdown("**Supported formats**")
     st.markdown(
-        "- YouTube (`youtube.com/watch?v=...`, `youtu.be/...`)\n"
-        "- Any site supported by yt-dlp\n"
-        "- Public, non-age-restricted videos work best"
+        "- Video: `mp4`, `mov`, `mkv`, `webm`, `avi`\n"
+        "- Audio: `mp3`, `wav`, `m4a`, `aac`, `ogg`"
     )
 
-with st.form("input_form"):
-    video_url = st.text_input(
-        "🎬 Video URL",
-        placeholder="https://www.youtube.com/watch?v=Mu3POlNoLdc",
+    st.divider()
+    st.markdown("**How to get the file**")
+    st.markdown(
+        "1. Open the recording in SharePoint/Teams/YouTube\n"
+        "2. Use **Download** (or a browser extension for YouTube)\n"
+        "3. Upload the file here"
     )
-    submitted = st.form_submit_button("🚀 Generate PDF", use_container_width=True)
+
+# ------------------------------------------------------------------
+# UPLOAD FORM
+# ------------------------------------------------------------------
+uploaded_file = st.file_uploader(
+    "🎬 Upload recording",
+    type=["mp4", "mov", "mkv", "webm", "avi",
+          "mp3", "wav", "m4a", "aac", "ogg"],
+    accept_multiple_files=False,
+)
+
+if uploaded_file:
+    st.success(
+        f"Uploaded: **{uploaded_file.name}** "
+        f"({uploaded_file.size / 1e6:.1f} MB)"
+    )
+
+generate = st.button("🚀 Generate PDF", use_container_width=True, type="primary")
 
 # ------------------------------------------------------------------
 # WORKDIR
 # ------------------------------------------------------------------
-WORKDIR = Path(tempfile.gettempdir()) / "video_to_pdf"
+WORKDIR = Path(tempfile.gettempdir()) / "kt_to_pdf"
 WORKDIR.mkdir(exist_ok=True)
 
-# ------------------------------------------------------------------
-# STEP 1 — DOWNLOAD VIDEO
-# ------------------------------------------------------------------
-def download_video(url: str, out_dir: Path) -> Path:
-    for f in out_dir.glob("video.*"):
-        try:
-            f.unlink()
-        except Exception:
-            pass
-
-    out_template = str(out_dir / "video.%(ext)s")
-
-    cmd = [
-        "yt-dlp",
-        "--remote-components", "ejs:github",
-        "--js-runtimes", "deno",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
-        "-o", out_template,
-        "--no-playlist",
-        "--no-warnings",
-        url,
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"yt-dlp failed (exit {result.returncode}):\n"
-            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
-        )
-
-    files = list(out_dir.glob("video.*"))
-    if not files:
-        raise RuntimeError("yt-dlp reported success but no output file was found.")
-    return files[0]
 
 # ------------------------------------------------------------------
-# STEP 2 — EXTRACT AUDIO
+# STEP 1 — SAVE UPLOADED FILE
 # ------------------------------------------------------------------
-def extract_audio(video_path: Path) -> Path:
-    audio_path = video_path.with_suffix(".wav")
+def save_upload(uploaded_file) -> Path:
+    suffix = Path(uploaded_file.name).suffix or ".mp4"
+    out_path = WORKDIR / f"upload{suffix}"
+    if out_path.exists():
+        out_path.unlink()
+    with open(out_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return out_path
+
+
+# ------------------------------------------------------------------
+# STEP 2 — EXTRACT AUDIO (if video)
+# ------------------------------------------------------------------
+def extract_audio(media_path: Path) -> Path:
+    audio_path = WORKDIR / "audio.wav"
+
+    if audio_path.exists():
+        audio_path.unlink()
+
     subprocess.run(
         [
-            "ffmpeg", "-y", "-i", str(video_path),
+            "ffmpeg", "-y", "-i", str(media_path),
             "-vn", "-acodec", "pcm_s16le",
             "-ar", "16000", "-ac", "1",
             str(audio_path),
@@ -148,6 +116,7 @@ def extract_audio(video_path: Path) -> Path:
         stderr=subprocess.DEVNULL,
     )
     return audio_path
+
 
 # ------------------------------------------------------------------
 # STEP 3 — TRANSCRIBE
@@ -160,13 +129,17 @@ def transcribe(audio_path: Path, model_size: str) -> dict:
 
     with st.spinner("Transcribing (this may take a while)..."):
         segments, info = model.transcribe(
-            str(audio_path), beam_size=5, word_timestamps=False,
+            str(audio_path),
+            beam_size=5,
+            word_timestamps=False,
         )
         result_segments = []
         full_text_parts = []
         for seg in segments:
             result_segments.append({
-                "start": seg.start, "end": seg.end, "text": seg.text,
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text,
             })
             full_text_parts.append(seg.text)
 
@@ -177,11 +150,13 @@ def transcribe(audio_path: Path, model_size: str) -> dict:
         "duration": info.duration,
     }
 
+
 def format_timestamp(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
 
 # ------------------------------------------------------------------
 # STEP 4 — PDF BUILD
@@ -190,34 +165,51 @@ class PDF(FPDF):
     def header(self):
         self.set_font("Helvetica", "B", 10)
         self.set_text_color(120, 120, 120)
-        self.cell(0, 8, "Video Transcript", align="R")
+        self.cell(0, 8, "KT Session Transcript", align="R")
         self.ln(10)
+
     def footer(self):
         self.set_y(-15)
         self.set_font("Helvetica", "I", 8)
         self.set_text_color(150, 150, 150)
         self.cell(0, 10, f"Page {self.page_no()}", align="C")
 
+
 def _safe(text: str) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
 
-def build_pdf(transcript: dict, title: str, url: str, out_path: Path, include_summary: bool):
+
+def build_pdf(transcript: dict, title: str, out_path: Path, include_summary: bool):
     pdf = PDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    pdf.set_font("Helvetica", "B", 20)
+    # Cover
+    pdf.set_font("Helvetica", "B", 22)
     pdf.set_text_color(0, 120, 212)
     pdf.ln(30)
-    pdf.multi_cell(0, 10, _safe(title), align="C")
-    pdf.ln(10)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(80, 80, 80)
-    pdf.cell(0, 8, _safe(f"Source: {url}"), align="C", ln=True)
-    pdf.cell(0, 8, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", align="C", ln=True)
-    pdf.cell(0, 8, f"Duration: {format_timestamp(transcript.get('duration', 0))}", align="C", ln=True)
-    pdf.cell(0, 8, f"Language: {transcript.get('language', 'unknown')}", align="C", ln=True)
+    pdf.multi_cell(0, 12, _safe(title), align="C")
 
+    pdf.ln(10)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(
+        0, 8,
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        align="C", ln=True,
+    )
+    pdf.cell(
+        0, 8,
+        f"Duration: {format_timestamp(transcript.get('duration', 0))}",
+        align="C", ln=True,
+    )
+    pdf.cell(
+        0, 8,
+        f"Language: {transcript.get('language', 'unknown')}",
+        align="C", ln=True,
+    )
+
+    # Summary
     if include_summary:
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 16)
@@ -226,6 +218,7 @@ def build_pdf(transcript: dict, title: str, url: str, out_path: Path, include_su
         pdf.ln(4)
         pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(40, 40, 40)
+
         segments = transcript.get("segments", [])
         picks = []
         if segments:
@@ -233,6 +226,7 @@ def build_pdf(transcript: dict, title: str, url: str, out_path: Path, include_su
             if len(segments) > 2:
                 picks.append(segments[len(segments) // 2])
             picks.append(segments[-1])
+
         for seg in picks:
             ts = format_timestamp(seg.get("start", 0))
             pdf.set_font("Helvetica", "B", 10)
@@ -241,6 +235,7 @@ def build_pdf(transcript: dict, title: str, url: str, out_path: Path, include_su
             pdf.multi_cell(0, 6, _safe(seg.get("text", "").strip()))
             pdf.ln(2)
 
+    # Full transcript
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
     pdf.set_text_color(0, 120, 212)
@@ -248,6 +243,7 @@ def build_pdf(transcript: dict, title: str, url: str, out_path: Path, include_su
     pdf.ln(4)
     pdf.set_font("Helvetica", "", 11)
     pdf.set_text_color(30, 30, 30)
+
     for seg in transcript.get("segments", []):
         ts = format_timestamp(seg.get("start", 0))
         text = _safe(seg.get("text", "").strip())
@@ -258,34 +254,39 @@ def build_pdf(transcript: dict, title: str, url: str, out_path: Path, include_su
         pdf.set_text_color(30, 30, 30)
         pdf.multi_cell(0, 6, text)
         pdf.ln(1)
+
     pdf.output(str(out_path))
+
 
 # ------------------------------------------------------------------
 # ORCHESTRATION
 # ------------------------------------------------------------------
-if submitted:
-    if not video_url:
-        st.error("Please provide a video URL.")
-        st.stop()
-
+if generate and uploaded_file:
     status = st.status("Starting pipeline...", expanded=True)
-    try:
-        status.write("⬇️ Downloading video...")
-        video_path = download_video(video_url, WORKDIR)
-        status.write(f"✅ Downloaded ({video_path.stat().st_size / 1e6:.1f} MB)")
 
+    try:
+        # 1. Save
+        status.write("💾 Saving uploaded file...")
+        media_path = save_upload(uploaded_file)
+        status.write(f"✅ Saved ({media_path.stat().st_size / 1e6:.1f} MB)")
+
+        # 2. Extract audio
         status.write("🎧 Extracting audio...")
-        audio_path = extract_audio(video_path)
+        audio_path = extract_audio(media_path)
         status.write("✅ Audio extracted")
 
+        # 3. Transcribe
         status.write(f"📝 Transcribing with Whisper '{whisper_model}'...")
         transcript = transcribe(audio_path, whisper_model)
-        status.write(f"✅ Transcribed {len(transcript.get('segments', []))} segments")
+        status.write(
+            f"✅ Transcribed {len(transcript.get('segments', []))} segments"
+        )
 
+        # 4. Build PDF
         status.write("📄 Building PDF...")
-        title = f"Video: {video_url}"
-        pdf_path = WORKDIR / "transcript.pdf"
-        build_pdf(transcript, title, video_url, pdf_path, include_summary)
+        title = Path(uploaded_file.name).stem.replace("_", " ").replace("-", " ")
+        pdf_path = WORKDIR / "KT_Transcript.pdf"
+        build_pdf(transcript, title, pdf_path, include_summary)
         status.write("✅ PDF generated")
 
         status.update(label="Pipeline complete ✅", state="complete")
@@ -293,10 +294,11 @@ if submitted:
 
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
+
         st.download_button(
-            "⬇️ Download PDF",
+            label="⬇️ Download PDF",
             data=pdf_bytes,
-            file_name=f"transcript_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+            file_name=f"KT_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
@@ -312,11 +314,6 @@ if submitted:
     except Exception as e:
         status.update(label="Pipeline failed ❌", state="error")
         st.exception(e)
-        st.info(
-            "**Common issues:**\n"
-            "- Video is age-restricted or region-blocked\n"
-            "- yt-dlp is outdated\n"
-            "- Deno failed to install (check build logs)\n"
-            "- Live stream still in progress\n"
-            "- ffmpeg missing from packages.txt"
-        )
+
+elif generate and not uploaded_file:
+    st.error("Please upload a file first.")
