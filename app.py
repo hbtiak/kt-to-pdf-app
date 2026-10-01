@@ -1,9 +1,10 @@
 """
-YouTube Video → PDF Generator
-Downloads a YouTube video, transcribes it with faster-whisper,
-and generates a downloadable PDF.
+Video → PDF Generator
+Downloads a YouTube video (or any yt-dlp-supported URL),
+transcribes it with faster-whisper, and generates a downloadable PDF.
 """
 
+import os
 import re
 import base64
 import tempfile
@@ -13,6 +14,35 @@ from datetime import datetime
 
 import streamlit as st
 from fpdf import FPDF
+
+# ------------------------------------------------------------------
+# ONE-TIME SETUP: Ensure a JS runtime for yt-dlp (Deno)
+# ------------------------------------------------------------------
+def _ensure_deno():
+    """Install Deno if not present. Required by yt-dlp for YouTube."""
+    deno_bin = Path("/home/appuser/.deno/bin/deno")
+    if deno_bin.exists():
+        os.environ["PATH"] = str(deno_bin.parent) + ":" + os.environ.get("PATH", "")
+        return
+
+    # Try installing to a writable location
+    home = Path.home()
+    deno_dir = home / ".deno"
+    deno_dir.mkdir(exist_ok=True)
+
+    with st.spinner("Installing Deno (first run only, ~30s)..."):
+        subprocess.run(
+            "curl -fsSL https://deno.land/install.sh | sh",
+            shell=True,
+            check=False,
+            env={**os.environ, "DENO_INSTALL": str(deno_dir)},
+        )
+
+    deno_bin_path = deno_dir / "bin" / "deno"
+    if deno_bin_path.exists():
+        os.environ["PATH"] = str(deno_bin_path.parent) + ":" + os.environ.get("PATH", "")
+
+_ensure_deno()
 
 # ------------------------------------------------------------------
 # PAGE CONFIG
@@ -25,7 +55,7 @@ st.set_page_config(
 
 st.title("📄 Video → PDF Generator")
 st.caption(
-    "Downloads a YouTube video, transcribes it with Whisper, "
+    "Downloads a video via yt-dlp, transcribes it with Whisper, "
     "and generates a downloadable PDF."
 )
 
@@ -39,7 +69,7 @@ with st.sidebar:
         "Whisper model",
         ["tiny", "base", "small", "medium"],
         index=1,
-        help="Larger = more accurate but slower.",
+        help="Larger = more accurate but slower. 'base' is good for CPU.",
     )
 
     include_summary = st.checkbox("Include summary page", value=True)
@@ -47,9 +77,9 @@ with st.sidebar:
     st.divider()
     st.markdown("**Supported URLs**")
     st.markdown(
-        "- `https://www.youtube.com/watch?v=...`\n"
-        "- `https://youtu.be/...`\n"
-        "- `https://www.youtube.com/live/...`"
+        "- YouTube (`youtube.com/watch?v=...`, `youtu.be/...`)\n"
+        "- Any site supported by yt-dlp\n"
+        "- Public, non-age-restricted videos work best"
     )
 
 # ------------------------------------------------------------------
@@ -57,7 +87,7 @@ with st.sidebar:
 # ------------------------------------------------------------------
 with st.form("input_form"):
     video_url = st.text_input(
-        "🎬 YouTube URL",
+        "🎬 Video URL",
         placeholder="https://www.youtube.com/watch?v=Mu3POlNoLdc",
     )
     submitted = st.form_submit_button("🚀 Generate PDF", use_container_width=True)
@@ -71,28 +101,45 @@ WORKDIR.mkdir(exist_ok=True)
 
 
 # ------------------------------------------------------------------
-# STEP 1 — DOWNLOAD FROM YOUTUBE
+# STEP 1 — DOWNLOAD VIDEO
 # ------------------------------------------------------------------
-def download_youtube(url: str, out_dir: Path) -> Path:
-    """Download YouTube video with yt-dlp, return the mp4 path."""
+def download_video(url: str, out_dir: Path) -> Path:
+    """Download video via yt-dlp. Returns local mp4 path."""
+    # Clean any prior downloads
+    for f in out_dir.glob("video.*"):
+        try:
+            f.unlink()
+        except Exception:
+            pass
+
     out_template = str(out_dir / "video.%(ext)s")
 
     cmd = [
         "yt-dlp",
+        "--remote-components", "ejs:github",
+        "--js-runtimes", "deno",
         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "--merge-output-format", "mp4",
         "-o", out_template,
         "--no-playlist",
+        "--no-warnings",
         url,
     ]
+
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed:\n{result.stderr}")
+        raise RuntimeError(
+            f"yt-dlp failed (exit {result.returncode}):\n"
+            f"STDOUT:\n{result.stdout}\n\n"
+            f"STDERR:\n{result.stderr}"
+        )
 
-    # Find the downloaded file
     files = list(out_dir.glob("video.*"))
     if not files:
-        raise RuntimeError("yt-dlp did not produce an output file.")
+        raise RuntimeError(
+            "yt-dlp reported success but no output file was found.\n"
+            f"STDOUT:\n{result.stdout}"
+        )
     return files[0]
 
 
@@ -116,7 +163,7 @@ def extract_audio(video_path: Path) -> Path:
 
 
 # ------------------------------------------------------------------
-# STEP 3 — TRANSCRIBE (faster-whisper)
+# STEP 3 — TRANSCRIBE
 # ------------------------------------------------------------------
 def transcribe(audio_path: Path, model_size: str) -> dict:
     from faster_whisper import WhisperModel
@@ -180,7 +227,13 @@ def _safe(text: str) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
-def build_pdf(transcript: dict, title: str, url: str, out_path: Path, include_summary: bool):
+def build_pdf(
+    transcript: dict,
+    title: str,
+    url: str,
+    out_path: Path,
+    include_summary: bool,
+):
     pdf = PDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
@@ -194,7 +247,7 @@ def build_pdf(transcript: dict, title: str, url: str, out_path: Path, include_su
     pdf.ln(10)
     pdf.set_font("Helvetica", "", 10)
     pdf.set_text_color(80, 80, 80)
-    pdf.cell(0, 8, f"Source: {url}", align="C", ln=True)
+    pdf.cell(0, 8, _safe(f"Source: {url}"), align="C", ln=True)
     pdf.cell(
         0, 8,
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
@@ -267,15 +320,15 @@ def build_pdf(transcript: dict, title: str, url: str, out_path: Path, include_su
 # ------------------------------------------------------------------
 if submitted:
     if not video_url:
-        st.error("Please provide a YouTube URL.")
+        st.error("Please provide a video URL.")
         st.stop()
 
     status = st.status("Starting pipeline...", expanded=True)
 
     try:
         # 1. Download
-        status.write("⬇️ Downloading video from YouTube...")
-        video_path = download_youtube(video_url, WORKDIR)
+        status.write("⬇️ Downloading video...")
+        video_path = download_video(video_url, WORKDIR)
         size_mb = video_path.stat().st_size / 1e6
         status.write(f"✅ Downloaded ({size_mb:.1f} MB)")
 
@@ -293,7 +346,7 @@ if submitted:
 
         # 4. Build PDF
         status.write("📄 Building PDF...")
-        title = f"YouTube Video {video_url}"
+        title = f"Video: {video_url}"
         pdf_path = WORKDIR / "transcript.pdf"
         build_pdf(transcript, title, video_url, pdf_path, include_summary)
         status.write("✅ PDF generated")
@@ -327,8 +380,9 @@ if submitted:
         st.exception(e)
         st.info(
             "**Common issues:**\n"
-            "- Video is age-restricted or region-blocked\n"
-            "- yt-dlp needs updating (YouTube changes frequently)\n"
-            "- Video is a live stream still in progress\n"
-            "- Check that ffmpeg is installed via packages.txt"
+            "- Video is age-restricted or region-blocked (yt-dlp needs cookies)\n"
+            "- yt-dlp is outdated (Streamlit reinstalls latest on each deploy)\n"
+            "- Deno failed to install (check build logs)\n"
+            "- Live stream still in progress\n"
+            "- ffmpeg missing from packages.txt"
         )
