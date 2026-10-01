@@ -1,14 +1,55 @@
 """
-KT Recording → PDF Generator (Manual Upload)
-User uploads a video file, app transcribes it, generates a PDF.
+KT Recording → PDF Generator
+Upload a video file, transcribe it, and generate a downloadable PDF.
 """
 
-import base64
-import tempfile
+import os
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from datetime import datetime
 
+# ------------------------------------------------------------------
+# CRITICAL FIX: Clear executable stack flag from ctranslate2 library
+# This must run BEFORE any import of faster_whisper or ctranslate2.
+# ------------------------------------------------------------------
+def _fix_ctranslate2_execstack():
+    """Finds the ctranslate2 shared library and clears its execstack flag."""
+    try:
+        # Find the site-packages directory for the current Python environment
+        import site
+        site_packages = site.getsitepackages()[0]
+        
+        # Find the library file matching the pattern
+        lib_pattern = "libctranslate2-*.so.*"
+        ctranslate2_lib_dir = Path(site_packages) / "ctranslate2.libs"
+        
+        if not ctranslate2_lib_dir.exists():
+            return  # Library directory not found, skip fix
+
+        for lib_file in ctranslate2_lib_dir.glob(lib_pattern):
+            print(f"Applying execstack fix to: {lib_file}")
+            # Use patchelf to clear the executable stack flag
+            result = subprocess.run(
+                ["patchelf", "--clear-execstack", str(lib_file)],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                print(f"patchelf warning: {result.stderr}")
+            else:
+                print(f"Successfully cleared execstack for {lib_file.name}")
+    except Exception as e:
+        # Log the error but don't crash the app
+        print(f"Could not apply ctranslate2 execstack fix: {e}")
+
+# Run the fix immediately
+_fix_ctranslate2_execstack()
+
+# ------------------------------------------------------------------
+# Now, safe to import everything else
+# ------------------------------------------------------------------
 import streamlit as st
 from fpdf import FPDF
 
@@ -49,14 +90,6 @@ with st.sidebar:
         "- Audio: `mp3`, `wav`, `m4a`, `aac`, `ogg`"
     )
 
-    st.divider()
-    st.markdown("**How to get the file**")
-    st.markdown(
-        "1. Open the recording in SharePoint/Teams/YouTube\n"
-        "2. Use **Download** (or a browser extension for YouTube)\n"
-        "3. Upload the file here"
-    )
-
 # ------------------------------------------------------------------
 # UPLOAD FORM
 # ------------------------------------------------------------------
@@ -81,7 +114,6 @@ generate = st.button("🚀 Generate PDF", use_container_width=True, type="primar
 WORKDIR = Path(tempfile.gettempdir()) / "kt_to_pdf"
 WORKDIR.mkdir(exist_ok=True)
 
-
 # ------------------------------------------------------------------
 # STEP 1 — SAVE UPLOADED FILE
 # ------------------------------------------------------------------
@@ -94,16 +126,13 @@ def save_upload(uploaded_file) -> Path:
         f.write(uploaded_file.getbuffer())
     return out_path
 
-
 # ------------------------------------------------------------------
 # STEP 2 — EXTRACT AUDIO (if video)
 # ------------------------------------------------------------------
 def extract_audio(media_path: Path) -> Path:
     audio_path = WORKDIR / "audio.wav"
-
     if audio_path.exists():
         audio_path.unlink()
-
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", str(media_path),
@@ -117,11 +146,11 @@ def extract_audio(media_path: Path) -> Path:
     )
     return audio_path
 
-
 # ------------------------------------------------------------------
 # STEP 3 — TRANSCRIBE
 # ------------------------------------------------------------------
 def transcribe(audio_path: Path, model_size: str) -> dict:
+    # This import now works because of the _fix_ctranslate2_execstack() call
     from faster_whisper import WhisperModel
 
     with st.spinner(f"Loading Whisper '{model_size}' model..."):
@@ -150,13 +179,11 @@ def transcribe(audio_path: Path, model_size: str) -> dict:
         "duration": info.duration,
     }
 
-
 def format_timestamp(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
-
 
 # ------------------------------------------------------------------
 # STEP 4 — PDF BUILD
@@ -167,17 +194,14 @@ class PDF(FPDF):
         self.set_text_color(120, 120, 120)
         self.cell(0, 8, "KT Session Transcript", align="R")
         self.ln(10)
-
     def footer(self):
         self.set_y(-15)
         self.set_font("Helvetica", "I", 8)
         self.set_text_color(150, 150, 150)
         self.cell(0, 10, f"Page {self.page_no()}", align="C")
 
-
 def _safe(text: str) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
-
 
 def build_pdf(transcript: dict, title: str, out_path: Path, include_summary: bool):
     pdf = PDF()
@@ -189,25 +213,12 @@ def build_pdf(transcript: dict, title: str, out_path: Path, include_summary: boo
     pdf.set_text_color(0, 120, 212)
     pdf.ln(30)
     pdf.multi_cell(0, 12, _safe(title), align="C")
-
     pdf.ln(10)
     pdf.set_font("Helvetica", "", 11)
     pdf.set_text_color(80, 80, 80)
-    pdf.cell(
-        0, 8,
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        align="C", ln=True,
-    )
-    pdf.cell(
-        0, 8,
-        f"Duration: {format_timestamp(transcript.get('duration', 0))}",
-        align="C", ln=True,
-    )
-    pdf.cell(
-        0, 8,
-        f"Language: {transcript.get('language', 'unknown')}",
-        align="C", ln=True,
-    )
+    pdf.cell(0, 8, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", align="C", ln=True)
+    pdf.cell(0, 8, f"Duration: {format_timestamp(transcript.get('duration', 0))}", align="C", ln=True)
+    pdf.cell(0, 8, f"Language: {transcript.get('language', 'unknown')}", align="C", ln=True)
 
     # Summary
     if include_summary:
@@ -218,7 +229,6 @@ def build_pdf(transcript: dict, title: str, out_path: Path, include_summary: boo
         pdf.ln(4)
         pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(40, 40, 40)
-
         segments = transcript.get("segments", [])
         picks = []
         if segments:
@@ -226,7 +236,6 @@ def build_pdf(transcript: dict, title: str, out_path: Path, include_summary: boo
             if len(segments) > 2:
                 picks.append(segments[len(segments) // 2])
             picks.append(segments[-1])
-
         for seg in picks:
             ts = format_timestamp(seg.get("start", 0))
             pdf.set_font("Helvetica", "B", 10)
@@ -243,7 +252,6 @@ def build_pdf(transcript: dict, title: str, out_path: Path, include_summary: boo
     pdf.ln(4)
     pdf.set_font("Helvetica", "", 11)
     pdf.set_text_color(30, 30, 30)
-
     for seg in transcript.get("segments", []):
         ts = format_timestamp(seg.get("start", 0))
         text = _safe(seg.get("text", "").strip())
@@ -254,35 +262,26 @@ def build_pdf(transcript: dict, title: str, out_path: Path, include_summary: boo
         pdf.set_text_color(30, 30, 30)
         pdf.multi_cell(0, 6, text)
         pdf.ln(1)
-
     pdf.output(str(out_path))
-
 
 # ------------------------------------------------------------------
 # ORCHESTRATION
 # ------------------------------------------------------------------
 if generate and uploaded_file:
     status = st.status("Starting pipeline...", expanded=True)
-
     try:
-        # 1. Save
         status.write("💾 Saving uploaded file...")
         media_path = save_upload(uploaded_file)
         status.write(f"✅ Saved ({media_path.stat().st_size / 1e6:.1f} MB)")
 
-        # 2. Extract audio
         status.write("🎧 Extracting audio...")
         audio_path = extract_audio(media_path)
         status.write("✅ Audio extracted")
 
-        # 3. Transcribe
         status.write(f"📝 Transcribing with Whisper '{whisper_model}'...")
         transcript = transcribe(audio_path, whisper_model)
-        status.write(
-            f"✅ Transcribed {len(transcript.get('segments', []))} segments"
-        )
+        status.write(f"✅ Transcribed {len(transcript.get('segments', []))} segments")
 
-        # 4. Build PDF
         status.write("📄 Building PDF...")
         title = Path(uploaded_file.name).stem.replace("_", " ").replace("-", " ")
         pdf_path = WORKDIR / "KT_Transcript.pdf"
@@ -294,7 +293,6 @@ if generate and uploaded_file:
 
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
-
         st.download_button(
             label="⬇️ Download PDF",
             data=pdf_bytes,
@@ -303,6 +301,7 @@ if generate and uploaded_file:
             use_container_width=True,
         )
 
+        import base64
         st.subheader("Preview")
         b64 = base64.b64encode(pdf_bytes).decode()
         st.markdown(
@@ -314,6 +313,5 @@ if generate and uploaded_file:
     except Exception as e:
         status.update(label="Pipeline failed ❌", state="error")
         st.exception(e)
-
 elif generate and not uploaded_file:
     st.error("Please upload a file first.")
