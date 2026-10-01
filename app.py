@@ -38,7 +38,6 @@ import base64
 import streamlit as st
 from fpdf import FPDF
 from PIL import Image
-import numpy as np
 
 # ------------------------------------------------------------------
 # PAGE CONFIG
@@ -184,7 +183,7 @@ def format_timestamp(seconds: float) -> str:
 # ------------------------------------------------------------------
 # STEP 4 — EXTRACT CANDIDATE FRAMES (scene detection)
 # ------------------------------------------------------------------
-def extract_candidate_frames(video_path: Path, threshold: float) -> list[dict]:
+def extract_candidate_frames(video_path: Path, threshold: float) -> list:
     """
     Use ffmpeg scene-change filter to get candidate frames.
     Returns list of {timestamp, path}.
@@ -194,20 +193,17 @@ def extract_candidate_frames(video_path: Path, threshold: float) -> list[dict]:
             f.unlink()
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ffmpeg writes frame_00001.jpg, frame_00002.jpg, ...
-    # We also capture the timestamps via showinfo
     out_pattern = str(FRAMES_DIR / "frame_%04d.jpg")
 
     cmd = [
         "ffmpeg", "-y", "-i", str(video_path),
         "-vf", f"select='gt(scene,{threshold})',showinfo",
         "-vsync", "vfr",
-        "-frame_pts", "1",  # use PTS as part of filename index
+        "-frame_pts", "1",
         out_pattern,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
 
-    # Parse stderr for pts_time values from showinfo
     timestamps = []
     for line in result.stderr.splitlines():
         if "pts_time:" in line:
@@ -217,7 +213,6 @@ def extract_candidate_frames(video_path: Path, threshold: float) -> list[dict]:
             except Exception:
                 continue
 
-    # Collect written frames in order
     frames = sorted(FRAMES_DIR.glob("frame_*.jpg"))
     candidates = []
     for i, frame in enumerate(frames):
@@ -243,7 +238,7 @@ def load_clip():
     return model, preprocess, tokenizer, torch
 
 
-def score_frames_with_clip(candidates: list[dict], transcript: dict) -> list[dict]:
+def score_frames_with_clip(candidates: list, transcript: dict) -> list:
     """
     For each candidate frame, find the transcript window around its
     timestamp, then score image-vs-text similarity with CLIP.
@@ -257,7 +252,6 @@ def score_frames_with_clip(candidates: list[dict], transcript: dict) -> list[dic
         return []
 
     def text_around(ts: float, window: float = 10.0) -> str:
-        """Concatenate transcript text within ±window seconds."""
         chunks = [
             s["text"] for s in segments
             if s["start"] <= ts + window and s["end"] >= ts - window
@@ -265,7 +259,6 @@ def score_frames_with_clip(candidates: list[dict], transcript: dict) -> list[dic
         text = " ".join(chunks).strip()
         return text if text else transcript.get("text", "")[:300]
 
-    # Pre-compute text embeddings
     results = []
     with torch.no_grad():
         for cand in candidates:
@@ -294,15 +287,15 @@ def score_frames_with_clip(candidates: list[dict], transcript: dict) -> list[dic
     return results
 
 
-def select_best_frames(scored: list[dict], max_n: int) -> list[dict]:
-    """Pick top-N frames, but ensure they're spread over time."""
+def select_best_frames(scored: list, max_n: int) -> list:
+    """Pick top-N frames, spread over time."""
     if not scored:
         return []
 
     scored = sorted(scored, key=lambda x: x["score"], reverse=True)
 
     selected = []
-    min_gap = 30.0  # seconds — avoid clustering too many frames together
+    min_gap = 30.0
 
     for cand in scored:
         if len(selected) >= max_n:
@@ -310,7 +303,6 @@ def select_best_frames(scored: list[dict], max_n: int) -> list[dict]:
         if all(abs(cand["timestamp"] - s["timestamp"]) >= min_gap for s in selected):
             selected.append(cand)
 
-    # If we couldn't fill max_n due to spacing, relax and fill
     if len(selected) < max_n:
         for cand in scored:
             if cand not in selected:
@@ -394,13 +386,12 @@ def build_pdf(transcript, title, out_path, include_summary, screenshots):
     pdf.cell(0, 10, "Full Transcript", ln=True)
     pdf.ln(4)
 
-    # Build a lookup: nearest segment start → screenshot
+    segments = transcript.get("segments", [])
+
+    # Map: segment id → screenshot
     shots_by_seg = {}
-    if screenshots:
+    if screenshots and segments:
         for shot in screenshots:
-            # Find the segment closest in start time
-            if not segments:
-                continue
             nearest = min(
                 segments,
                 key=lambda s: abs(s["start"] - shot["timestamp"]),
@@ -411,18 +402,15 @@ def build_pdf(transcript, title, out_path, include_summary, screenshots):
         ts = format_timestamp(seg.get("start", 0))
         text = _safe(seg.get("text", "").strip())
 
-        # Insert screenshot right before this segment if assigned
         shot = shots_by_seg.get(id(seg))
         if shot:
             try:
                 img = Image.open(shot["path"])
-                # Fit within content width (~180mm on A4 with 15mm margins)
                 max_w_mm = 160
                 w, h = img.size
                 ratio = h / w
                 img_w = max_w_mm
                 img_h = img_w * ratio
-                # Cap height
                 if img_h > 90:
                     img_h = 90
                     img_w = img_h / ratio
@@ -444,7 +432,6 @@ def build_pdf(transcript, title, out_path, include_summary, screenshots):
                 pdf.set_text_color(200, 80, 80)
                 pdf.cell(0, 5, f"(Screenshot failed: {e})", ln=True)
 
-        # Segment text
         pdf.set_font("Helvetica", "B", 9)
         pdf.set_text_color(0, 120, 212)
         pdf.cell(22, 6, f"[{ts}]", ln=False)
@@ -498,7 +485,6 @@ if generate and uploaded_file:
                         f"✅ Selected {len(screenshots)} relevant screenshots"
                     )
 
-                    # Show previews in the app
                     if screenshots:
                         st.subheader("🎯 AI-Selected Screenshots")
                         cols = st.columns(min(len(screenshots), 3))
@@ -510,7 +496,7 @@ if generate and uploaded_file:
                                         f"{format_timestamp(s['timestamp'])} "
                                         f"(score {s['score']:.2f})"
                                     ),
-                                    use_container_width=True,
+                                    use_column_width=True,
                                 )
 
         # 5. Build PDF
